@@ -1,10 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -13,17 +15,23 @@ namespace SpeedMonitor;
 
 public sealed class SpeedMonitorForm : Form
 {
-    private const int WindowWidth = 160;
-    private const int WindowHeight = 72;
+    private const int WindowWidth = 176;
+    private const int WindowHeight = 142;
     private const int CornerRadius = 12;
+    private const int WmNcLeftButtonDown = 0x00A1;
+    private const int HtCaption = 0x02;
     private const string StartupValueName = "SpeedMonitor";
     private const string StartupRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
 
     private readonly Label _downloadLabel;
     private readonly Label _uploadLabel;
+    private readonly Label _cpuLabel;
+    private readonly Label _memoryLabel;
+    private readonly Label _gpuLabel;
     private readonly Label _errorLabel;
     private readonly System.Windows.Forms.Timer _timer;
     private readonly Stopwatch _stopwatch = new();
+    private readonly SystemMetricsReader _systemMetricsReader = new();
     private readonly ContextMenuStrip _contextMenu;
     private readonly ToolStripMenuItem _pinItem;
     private readonly ToolStripMenuItem _startupItem;
@@ -32,7 +40,6 @@ public sealed class SpeedMonitorForm : Form
     private readonly string _configPath;
 
     private AppConfig _config;
-    private Point _dragOffset;
     private bool _dragging;
     private long _lastReceived;
     private long _lastSent;
@@ -55,14 +62,20 @@ public sealed class SpeedMonitorForm : Form
         Opacity = GetOpacity(_config.OpacityPercent);
         DoubleBuffered = true;
 
-        _downloadLabel = CreateSpeedLabel("↓ 0 KB/s", Color.FromArgb(114, 222, 84), 12);
-        _uploadLabel = CreateSpeedLabel("↑ 0 KB/s", Color.FromArgb(58, 160, 255), 36);
-        _errorLabel = CreateSpeedLabel("读取中...", Color.FromArgb(255, 107, 107), 22);
+        _downloadLabel = CreateMetricLabel("↓ 0 KB/s", Color.FromArgb(114, 222, 84), 10);
+        _uploadLabel = CreateMetricLabel("↑ 0 KB/s", Color.FromArgb(58, 160, 255), 34);
+        _cpuLabel = CreateMetricLabel("CPU --%", Color.FromArgb(255, 196, 87), 58);
+        _memoryLabel = CreateMetricLabel("内存 --%", Color.FromArgb(201, 135, 255), 82);
+        _gpuLabel = CreateMetricLabel("GPU0 --%", Color.FromArgb(87, 214, 201), 106);
+        _errorLabel = CreateMetricLabel("读取中...", Color.FromArgb(255, 107, 107), 58);
         _errorLabel.TextAlign = ContentAlignment.MiddleCenter;
         _errorLabel.Visible = false;
 
         Controls.Add(_downloadLabel);
         Controls.Add(_uploadLabel);
+        Controls.Add(_cpuLabel);
+        Controls.Add(_memoryLabel);
+        Controls.Add(_gpuLabel);
         Controls.Add(_errorLabel);
 
         (_contextMenu, _pinItem, _startupItem, _themeItem, _opacityItems) = CreateContextMenu();
@@ -72,13 +85,9 @@ public sealed class SpeedMonitorForm : Form
         _timer.Tick += (_, _) => UpdateSpeed();
 
         MouseDown += OnDragMouseDown;
-        MouseMove += OnDragMouseMove;
-        MouseUp += OnDragMouseUp;
         foreach (Control control in Controls)
         {
             control.MouseDown += OnDragMouseDown;
-            control.MouseMove += OnDragMouseMove;
-            control.MouseUp += OnDragMouseUp;
         }
 
         RestorePosition();
@@ -102,6 +111,7 @@ public sealed class SpeedMonitorForm : Form
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         _timer.Stop();
+        _systemMetricsReader.Dispose();
         SaveCurrentSettings();
         base.OnFormClosing(e);
     }
@@ -120,14 +130,14 @@ public sealed class SpeedMonitorForm : Form
         e.Graphics.DrawPath(borderPen, path);
     }
 
-    private static Label CreateSpeedLabel(string text, Color color, int top)
+    private static Label CreateMetricLabel(string text, Color color, int top)
     {
         return new Label
         {
             AutoSize = false,
             BackColor = Color.Transparent,
             ForeColor = color,
-            Font = new Font("Segoe UI Semibold", 13F, FontStyle.Bold, GraphicsUnit.Point),
+            Font = new Font("Segoe UI Semibold", 12F, FontStyle.Bold, GraphicsUnit.Point),
             Location = new Point(16, top),
             Size = new Size(WindowWidth - 32, 24),
             Text = text,
@@ -269,6 +279,11 @@ public sealed class SpeedMonitorForm : Form
 
     private void UpdateSpeed()
     {
+        if (_dragging)
+        {
+            return;
+        }
+
         try
         {
             var elapsedSeconds = Math.Max(_stopwatch.Elapsed.TotalSeconds, 0.001d);
@@ -283,6 +298,7 @@ public sealed class SpeedMonitorForm : Form
 
             _downloadLabel.Text = $"↓ {FormatSpeed(downloadSpeed)}";
             _uploadLabel.Text = $"↑ {FormatSpeed(uploadSpeed)}";
+            UpdateSystemMetricLabels();
             ShowSpeedLabels();
         }
         catch
@@ -324,17 +340,36 @@ public sealed class SpeedMonitorForm : Form
             : $"{kbPerSecond / 1024d:0.00} MB/s";
     }
 
+    private void UpdateSystemMetricLabels()
+    {
+        var metrics = _systemMetricsReader.Read();
+        _cpuLabel.Text = $"CPU {FormatPercent(metrics.CpuUsagePercent)}";
+        _memoryLabel.Text = $"内存 {FormatPercent(metrics.MemoryUsagePercent)}";
+        _gpuLabel.Text = $"GPU0 {FormatPercent(metrics.Gpu0UsagePercent)}";
+    }
+
+    private static string FormatPercent(double? percent)
+    {
+        return percent.HasValue ? $"{Math.Clamp(percent.Value, 0d, 100d):0}%" : "--%";
+    }
+
     private void ShowSpeedLabels()
     {
         _errorLabel.Visible = false;
         _downloadLabel.Visible = true;
         _uploadLabel.Visible = true;
+        _cpuLabel.Visible = true;
+        _memoryLabel.Visible = true;
+        _gpuLabel.Visible = true;
     }
 
     private void ShowError()
     {
         _downloadLabel.Visible = false;
         _uploadLabel.Visible = false;
+        _cpuLabel.Visible = false;
+        _memoryLabel.Visible = false;
+        _gpuLabel.Visible = false;
         _errorLabel.Visible = true;
     }
 
@@ -391,7 +426,7 @@ public sealed class SpeedMonitorForm : Form
     {
         pinItem.Text = $"{(TopMost ? "✓ " : "    ")}📌  置顶";
         startupItem.Text = $"{(IsStartupEnabled() ? "✓ " : "    ")}🚀  开机自启";
-        themeItem.Text = IsLightTheme() ? "    ☀️  亮色模式" : "    🌙  暗色模式";
+        themeItem.Text = IsLightTheme() ? "    🌙  暗色模式" : "    ☀️  亮色模式";
 
         var currentTransparency = (int)Math.Round((1d - Opacity) * 100d);
         foreach (var item in opacityItems)
@@ -498,29 +533,20 @@ public sealed class SpeedMonitorForm : Form
         }
 
         _dragging = true;
-        _dragOffset = PointToClient(Cursor.Position);
-    }
+        _timer.Stop();
 
-    private void OnDragMouseMove(object? sender, MouseEventArgs e)
-    {
-        if (!_dragging)
+        try
         {
-            return;
+            ReleaseCapture();
+            SendMessage(Handle, WmNcLeftButtonDown, HtCaption, 0);
         }
-
-        var cursor = Cursor.Position;
-        Location = new Point(cursor.X - _dragOffset.X, cursor.Y - _dragOffset.Y);
-    }
-
-    private void OnDragMouseUp(object? sender, MouseEventArgs e)
-    {
-        if (e.Button != MouseButtons.Left)
+        finally
         {
-            return;
+            _dragging = false;
+            SaveCurrentSettings();
+            _stopwatch.Restart();
+            _timer.Start();
         }
-
-        _dragging = false;
-        SaveCurrentSettings();
     }
 
     private sealed class ThemedMenuRenderer : ToolStripProfessionalRenderer
@@ -586,6 +612,191 @@ public sealed class SpeedMonitorForm : Form
         Color MenuForeColor,
         Color MenuBorderColor,
         Color MenuSelectedColor);
+
+    private readonly record struct SystemMetrics(
+        double? CpuUsagePercent,
+        double? MemoryUsagePercent,
+        double? Gpu0UsagePercent);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
+
+    private sealed class SystemMetricsReader : IDisposable
+    {
+        private readonly List<PerformanceCounter> _gpuCounters = new();
+        private ulong _lastIdleTime;
+        private ulong _lastKernelTime;
+        private ulong _lastUserTime;
+        private bool _hasCpuSample;
+        private bool _gpuCountersInitialized;
+
+        public SystemMetrics Read()
+        {
+            return new SystemMetrics(
+                ReadCpuUsagePercent(),
+                ReadMemoryUsagePercent(),
+                ReadGpu0UsagePercent());
+        }
+
+        public void Dispose()
+        {
+            foreach (var counter in _gpuCounters)
+            {
+                counter.Dispose();
+            }
+
+            _gpuCounters.Clear();
+        }
+
+        private double? ReadCpuUsagePercent()
+        {
+            if (!GetSystemTimes(out var idleTime, out var kernelTime, out var userTime))
+            {
+                return null;
+            }
+
+            var idle = ToUInt64(idleTime);
+            var kernel = ToUInt64(kernelTime);
+            var user = ToUInt64(userTime);
+
+            if (!_hasCpuSample)
+            {
+                _lastIdleTime = idle;
+                _lastKernelTime = kernel;
+                _lastUserTime = user;
+                _hasCpuSample = true;
+                return null;
+            }
+
+            var idleDelta = idle - _lastIdleTime;
+            var kernelDelta = kernel - _lastKernelTime;
+            var userDelta = user - _lastUserTime;
+            var totalDelta = kernelDelta + userDelta;
+
+            _lastIdleTime = idle;
+            _lastKernelTime = kernel;
+            _lastUserTime = user;
+
+            if (totalDelta == 0)
+            {
+                return null;
+            }
+
+            return (1d - (double)idleDelta / totalDelta) * 100d;
+        }
+
+        private static double? ReadMemoryUsagePercent()
+        {
+            var status = new MemoryStatusEx();
+            if (!GlobalMemoryStatusEx(status))
+            {
+                return null;
+            }
+
+            return status.MemoryLoad;
+        }
+
+        private double? ReadGpu0UsagePercent()
+        {
+            if (!_gpuCountersInitialized)
+            {
+                InitializeGpuCounters();
+            }
+
+            if (_gpuCounters.Count == 0)
+            {
+                return null;
+            }
+
+            double usage = 0d;
+            var validSamples = 0;
+            foreach (var counter in _gpuCounters)
+            {
+                try
+                {
+                    usage = Math.Max(usage, counter.NextValue());
+                    validSamples++;
+                }
+                catch
+                {
+                    // GPU performance counter instances can disappear when drivers reset.
+                }
+            }
+
+            return validSamples == 0 ? null : usage;
+        }
+
+        private void InitializeGpuCounters()
+        {
+            _gpuCountersInitialized = true;
+
+            try
+            {
+                var category = new PerformanceCounterCategory("GPU Engine");
+                foreach (var instanceName in category.GetInstanceNames())
+                {
+                    if (!IsGpu0Engine(instanceName))
+                    {
+                        continue;
+                    }
+
+                    var counter = new PerformanceCounter("GPU Engine", "Utilization Percentage", instanceName, true);
+                    counter.NextValue();
+                    _gpuCounters.Add(counter);
+                }
+            }
+            catch
+            {
+                _gpuCounters.Clear();
+            }
+        }
+
+        private static bool IsGpu0Engine(string instanceName)
+        {
+            return instanceName.Contains("phys_0", StringComparison.OrdinalIgnoreCase)
+                && instanceName.Contains("engtype_", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static ulong ToUInt64(FileTime fileTime)
+        {
+            return ((ulong)fileTime.HighDateTime << 32) | fileTime.LowDateTime;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetSystemTimes(out FileTime idleTime, out FileTime kernelTime, out FileTime userTime);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GlobalMemoryStatusEx([In, Out] MemoryStatusEx lpBuffer);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileTime
+        {
+            public uint LowDateTime;
+            public uint HighDateTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private sealed class MemoryStatusEx
+        {
+            public uint Length;
+            public uint MemoryLoad;
+            public ulong TotalPhys;
+            public ulong AvailPhys;
+            public ulong TotalPageFile;
+            public ulong AvailPageFile;
+            public ulong TotalVirtual;
+            public ulong AvailVirtual;
+            public ulong AvailExtendedVirtual;
+
+            public MemoryStatusEx()
+            {
+                Length = (uint)Marshal.SizeOf<MemoryStatusEx>();
+            }
+        }
+    }
 
     private sealed class AppConfig
     {

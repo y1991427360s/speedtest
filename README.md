@@ -2,11 +2,14 @@
 
 这是一个使用 C# + WinForms 实现的 Windows 原生悬浮网速监控工具，不再依赖 Python、PyInstaller 或 Electron。
 
-程序启动后会在屏幕右上角显示一个小型悬浮窗，实时展示下载和上传速度：
+程序启动后会在屏幕右上角显示一个小型悬浮窗，实时展示下载/上传速度、CPU 使用率、内存使用率和 GPU 0 使用率：
 
 ```text
 ↓ 1.25 MB/s
 ↑ 256 KB/s
+CPU 12%
+内存 46%
+GPU0 8%
 ```
 
 ## 功能
@@ -18,6 +21,7 @@
 - 无边框
 - 深色圆角半透明背景
 - 每 1 秒刷新网速
+- 每 1 秒刷新 CPU、内存、GPU 0 使用率
 - 自动单位换算：KB/s、MB/s
 - 支持鼠标左键拖动位置
 - 拖动后自动保存位置到 `config.json`
@@ -36,6 +40,12 @@
 - 读取 `IPv4InterfaceStatistics.BytesReceived`
 - 读取 `IPv4InterfaceStatistics.BytesSent`
 - 每秒计算累计字节差值并换算为速度
+
+## 系统资源读取方式
+
+- CPU：使用 Windows `GetSystemTimes` 计算总 CPU 使用率
+- 内存：使用 Windows `GlobalMemoryStatusEx` 读取物理内存使用率
+- GPU 0：读取 Windows `GPU Engine` 性能计数器中 `phys_0` 的 `Utilization Percentage`
 
 ## 环境要求
 
