@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.NetworkInformation;
@@ -626,12 +627,17 @@ public sealed class SpeedMonitorForm : Form
 
     private sealed class SystemMetricsReader : IDisposable
     {
-        private readonly List<PerformanceCounter> _gpuCounters = new();
+        private static readonly TimeSpan GpuCounterRefreshInterval = TimeSpan.FromSeconds(2);
+
+        private readonly Dictionary<string, GpuEngineCounter> _gpuCounters = new(StringComparer.OrdinalIgnoreCase);
         private ulong _lastIdleTime;
         private ulong _lastKernelTime;
         private ulong _lastUserTime;
+        private DateTime _lastGpuCounterRefreshUtc = DateTime.MinValue;
+        private string? _nvidiaSmiPath;
         private bool _hasCpuSample;
         private bool _gpuCountersInitialized;
+        private bool _nvidiaSmiPathResolved;
 
         public SystemMetrics Read()
         {
@@ -643,9 +649,9 @@ public sealed class SpeedMonitorForm : Form
 
         public void Dispose()
         {
-            foreach (var counter in _gpuCounters)
+            foreach (var counter in _gpuCounters.Values)
             {
-                counter.Dispose();
+                counter.Counter.Dispose();
             }
 
             _gpuCounters.Clear();
@@ -701,64 +707,259 @@ public sealed class SpeedMonitorForm : Form
 
         private double? ReadGpu0UsagePercent()
         {
+            var nvidiaUsage = ReadNvidiaSmiGpu0UsagePercent();
+            if (nvidiaUsage.HasValue)
+            {
+                return nvidiaUsage;
+            }
+
             if (!_gpuCountersInitialized)
             {
-                InitializeGpuCounters();
+                _gpuCountersInitialized = true;
+                RefreshGpuCounters(force: true);
             }
-
-            if (_gpuCounters.Count == 0)
+            else
             {
-                return null;
+                RefreshGpuCounters(force: false);
             }
 
+            return ReadWindowsGpu0UsagePercent();
+        }
+
+        private double? ReadWindowsGpu0UsagePercent()
+        {
             double usage = 0d;
             var validSamples = 0;
-            foreach (var counter in _gpuCounters)
+            var engineTotals = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            var staleCounters = new List<string>();
+
+            foreach (var item in _gpuCounters)
             {
                 try
                 {
-                    usage = Math.Max(usage, counter.NextValue());
+                    var value = item.Value.Counter.NextValue();
+                    engineTotals[item.Value.EngineKey] = engineTotals.TryGetValue(item.Value.EngineKey, out var total)
+                        ? total + value
+                        : value;
                     validSamples++;
                 }
                 catch
                 {
                     // GPU performance counter instances can disappear when drivers reset.
+                    staleCounters.Add(item.Key);
                 }
+            }
+
+            foreach (var instanceName in staleCounters)
+            {
+                if (_gpuCounters.Remove(instanceName, out var staleCounter))
+                {
+                    staleCounter.Counter.Dispose();
+                }
+            }
+
+            foreach (var engineTotal in engineTotals.Values)
+            {
+                usage = Math.Max(usage, engineTotal);
             }
 
             return validSamples == 0 ? null : usage;
         }
 
-        private void InitializeGpuCounters()
+        private void RefreshGpuCounters(bool force)
         {
-            _gpuCountersInitialized = true;
+            var now = DateTime.UtcNow;
+            if (!force && now - _lastGpuCounterRefreshUtc < GpuCounterRefreshInterval)
+            {
+                return;
+            }
+
+            _lastGpuCounterRefreshUtc = now;
 
             try
             {
                 var category = new PerformanceCounterCategory("GPU Engine");
+                var activeInstances = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
                 foreach (var instanceName in category.GetInstanceNames())
                 {
-                    if (!IsGpu0Engine(instanceName))
+                    var engineKey = GetGpu0EngineKey(instanceName);
+                    if (engineKey is null)
+                    {
+                        continue;
+                    }
+
+                    activeInstances.Add(instanceName);
+                    if (_gpuCounters.ContainsKey(instanceName))
                     {
                         continue;
                     }
 
                     var counter = new PerformanceCounter("GPU Engine", "Utilization Percentage", instanceName, true);
                     counter.NextValue();
-                    _gpuCounters.Add(counter);
+                    _gpuCounters.Add(instanceName, new GpuEngineCounter(instanceName, engineKey, counter));
+                }
+
+                foreach (var instanceName in _gpuCounters.Keys.Except(activeInstances, StringComparer.OrdinalIgnoreCase).ToArray())
+                {
+                    var staleCounter = _gpuCounters[instanceName];
+                    staleCounter.Counter.Dispose();
+                    _gpuCounters.Remove(instanceName);
                 }
             }
             catch
             {
+                foreach (var counter in _gpuCounters.Values)
+                {
+                    counter.Counter.Dispose();
+                }
+
                 _gpuCounters.Clear();
             }
         }
 
-        private static bool IsGpu0Engine(string instanceName)
+        private double? ReadNvidiaSmiGpu0UsagePercent()
         {
-            return instanceName.Contains("phys_0", StringComparison.OrdinalIgnoreCase)
-                && instanceName.Contains("engtype_", StringComparison.OrdinalIgnoreCase);
+            var nvidiaSmiPath = GetNvidiaSmiPath();
+            if (nvidiaSmiPath is null)
+            {
+                return null;
+            }
+
+            try
+            {
+                using var process = new Process();
+                process.StartInfo = new ProcessStartInfo
+                {
+                    FileName = nvidiaSmiPath,
+                    Arguments = "--query-gpu=utilization.gpu --format=csv,noheader,nounits -i 0",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+
+                if (!process.Start())
+                {
+                    return null;
+                }
+
+                if (!process.WaitForExit(700))
+                {
+                    try
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                    catch
+                    {
+                        // Best-effort cleanup only.
+                    }
+
+                    return null;
+                }
+
+                if (process.ExitCode != 0)
+                {
+                    return null;
+                }
+
+                var output = process.StandardOutput.ReadToEnd();
+                var firstLine = output
+                    .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                    .FirstOrDefault();
+
+                return double.TryParse(firstLine, NumberStyles.Float, CultureInfo.InvariantCulture, out var usage)
+                    ? usage
+                    : null;
+            }
+            catch
+            {
+                return null;
+            }
         }
+
+        private string? GetNvidiaSmiPath()
+        {
+            if (_nvidiaSmiPathResolved)
+            {
+                return _nvidiaSmiPath;
+            }
+
+            _nvidiaSmiPathResolved = true;
+
+            var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            var defaultPath = Path.Combine(programFiles, "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe");
+            if (File.Exists(defaultPath))
+            {
+                _nvidiaSmiPath = defaultPath;
+                return _nvidiaSmiPath;
+            }
+
+            _nvidiaSmiPath = "nvidia-smi.exe";
+            try
+            {
+                using var process = new Process();
+                process.StartInfo = new ProcessStartInfo
+                {
+                    FileName = _nvidiaSmiPath,
+                    Arguments = "--version",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+
+                if (!process.Start())
+                {
+                    _nvidiaSmiPath = null;
+                    return null;
+                }
+
+                if (!process.WaitForExit(700))
+                {
+                    try
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                    catch
+                    {
+                        // Best-effort cleanup only.
+                    }
+
+                    _nvidiaSmiPath = null;
+                    return null;
+                }
+
+                if (process.ExitCode == 0)
+                {
+                    return _nvidiaSmiPath;
+                }
+            }
+            catch
+            {
+                // NVIDIA-SMI is optional; Windows counters remain the fallback.
+            }
+
+            _nvidiaSmiPath = null;
+            return null;
+        }
+
+        private static string? GetGpu0EngineKey(string instanceName)
+        {
+            if (!instanceName.Contains("phys_0", StringComparison.OrdinalIgnoreCase)
+                || !instanceName.Contains("_eng_", StringComparison.OrdinalIgnoreCase)
+                || !instanceName.Contains("engtype_", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            var luidIndex = instanceName.IndexOf("luid_", StringComparison.OrdinalIgnoreCase);
+            return luidIndex >= 0
+                ? instanceName[luidIndex..]
+                : instanceName;
+        }
+
+        private sealed record GpuEngineCounter(string InstanceName, string EngineKey, PerformanceCounter Counter);
 
         private static ulong ToUInt64(FileTime fileTime)
         {

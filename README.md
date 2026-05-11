@@ -45,7 +45,7 @@ GPU0 8%
 
 - CPU：使用 Windows `GetSystemTimes` 计算总 CPU 使用率
 - 内存：使用 Windows `GlobalMemoryStatusEx` 读取物理内存使用率
-- GPU 0：读取 Windows `GPU Engine` 性能计数器中 `phys_0` 的 `Utilization Percentage`
+- GPU 0：NVIDIA 显卡优先读取 `nvidia-smi` 的 GPU 0 总使用率；其它情况读取 Windows `GPU Engine` 性能计数器中 `phys_0` 的 `Utilization Percentage`
 
 ## 环境要求
 
